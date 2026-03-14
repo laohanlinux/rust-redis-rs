@@ -116,7 +116,7 @@ impl ConnPool {
                 return Ok(PoolGuard {
                     pool: self,
                     conn: Some(conn),
-                    _permit: _permit,
+                    _permit,
                 });
             }
             drop(idle);
@@ -136,7 +136,7 @@ impl ConnPool {
             return Ok(PoolGuard {
                 pool: self,
                 conn: Some(conn),
-                _permit: _permit,
+                _permit,
             });
         }
     }
@@ -147,13 +147,6 @@ impl ConnPool {
         let buffer_size = conn.buffer_size();
         if buffer_size > 0 {
             trace!(buffer_size, "connection has unread data, not returning to pool");
-        }
-        let closed = self.closed.lock().await;
-        if *closed {
-            return;
-        }
-
-        if conn.buffer_size() > 0 {
             return;
         }
 
@@ -161,6 +154,12 @@ impl ConnPool {
             conn,
             used_at: Instant::now(),
         };
+
+        // Hold closed lock until after push to prevent race with close()
+        let closed = self.closed.lock().await;
+        if *closed {
+            return;
+        }
         let mut idle = self.idle.lock().await;
         idle.push(pc);
         trace!(idle_count = idle.len(), "returned connection to pool");

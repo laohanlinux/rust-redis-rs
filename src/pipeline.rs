@@ -50,25 +50,38 @@ impl Pipeline {
     }
 
     /// Execute all commands in the pipeline and return results in order.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use rust_redis_rs::{Client, ClientOptions};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = Client::new(ClientOptions::default());
+    /// let pipeline = client.pipeline();
+    /// pipeline.set("k1", "v1").await;
+    /// pipeline.get("k1").await;
+    /// let results = pipeline.execute().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     #[instrument(skip(self))]
     pub async fn execute(&self) -> Result<Vec<Value>> {
-        let cmd_count = self.cmds.lock().await.len();
-        tracing::trace!(cmd_count, "executing pipeline");
-        let cmds = self.cmds.lock().await.clone();
-        if cmds.is_empty() {
+        let args_list: Vec<Vec<String>> = {
+            let mut cmds = self.cmds.lock().await;
+            std::mem::take(&mut *cmds)
+        };
+        tracing::trace!(cmd_count = args_list.len(), "executing pipeline");
+        if args_list.is_empty() {
             return Ok(vec![]);
         }
-        drop(cmds);
-
-        let cmds = self.cmds.lock().await;
-        let args_list = cmds.clone();
-        drop(cmds);
 
         let mut guard = self.client.pool().get().await?;
         let conn = guard.conn();
 
         // Serialize all commands into a single buffer and send
-        let mut buf = Vec::new();
+        let total_size: usize = args_list.iter().map(|a| parser::estimate_resp_size(a)).sum();
+        let mut buf = Vec::with_capacity(total_size);
         for args in &args_list {
             parser::append_args(&mut buf, args);
         }

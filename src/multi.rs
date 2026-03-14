@@ -32,9 +32,11 @@ impl Multi {
     /// Execute the transaction.
     #[instrument(skip(self))]
     pub async fn exec(&self) -> Result<Vec<Value>> {
-        let cmd_count = self.cmds.lock().await.len();
-        tracing::trace!(cmd_count, "executing transaction");
-        let cmds = self.cmds.lock().await.clone();
+        let cmds: Vec<Vec<String>> = {
+            let mut guard = self.cmds.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        tracing::trace!(cmd_count = cmds.len(), "executing transaction");
         if cmds.is_empty() {
             return Ok(vec![]);
         }
@@ -43,7 +45,10 @@ impl Multi {
         let conn = guard.conn();
 
         // Send MULTI, all queued commands, then EXEC
-        let mut buf = Vec::new();
+        let total_size = parser::estimate_resp_size(&["MULTI"])
+            + cmds.iter().map(|a| parser::estimate_resp_size(a)).sum::<usize>()
+            + parser::estimate_resp_size(&["EXEC"]);
+        let mut buf = Vec::with_capacity(total_size);
         parser::append_args(&mut buf, &["MULTI"]);
         for args in &cmds {
             parser::append_args(&mut buf, args);

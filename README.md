@@ -2,6 +2,8 @@
 
 Redis client for Rust - async implementation with Tokio. Implements the full functionality of [go-redis v2](https://github.com/redis/go-redis/tree/v2).
 
+See [doc/architecture.md](doc/architecture.md) for architecture diagram and business process flowcharts.
+
 ## Features
 
 - **Connection pool** - Configurable pool size and idle timeout
@@ -18,8 +20,10 @@ Redis client for Rust - async implementation with Tokio. Implements the full fun
 ```toml
 [dependencies]
 rust-redis-rs = "0.1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 ```
+
+Or use `features = ["full"]` for all Tokio features (larger binary).
 
 ## Usage
 
@@ -42,8 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### With password and database
 
 ```rust
+use rust_redis_rs::{Client, ClientOptions, DEFAULT_ADDR};
+
 let client = Client::new(ClientOptions {
-    addr: "127.0.0.1:6379".to_string(),
+    addr: DEFAULT_ADDR.to_string(),
     password: Some("secret".to_string()),
     db: 1,
     ..Default::default()

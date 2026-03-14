@@ -109,6 +109,12 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl From<&str> for Error {
+    fn from(s: &str) -> Self {
+        Error::Other(s.into())
+    }
+}
+
 /// Create a Redis error from format string.
 pub fn redis_error(s: &str) -> RedisError {
     RedisError(s.to_string())
@@ -147,5 +153,11 @@ mod tests {
     fn test_redis_error_helper() {
         let re = redis_error("test message");
         assert_eq!(re.0, "test message");
+    }
+
+    #[test]
+    fn test_error_from_str() {
+        let err: Error = "expected status".into();
+        assert!(matches!(err, Error::Other(s) if s == "expected status"));
     }
 }

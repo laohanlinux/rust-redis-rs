@@ -8,6 +8,9 @@ use tracing::instrument;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
+/// Default Redis server address.
+pub const DEFAULT_ADDR: &str = "127.0.0.1:6379";
+
 /// Client options for connecting to Redis.
 #[derive(Clone)]
 pub struct ClientOptions {
@@ -32,7 +35,7 @@ pub struct ClientOptions {
 impl Default for ClientOptions {
     fn default() -> Self {
         Self {
-            addr: "127.0.0.1:6379".to_string(),
+            addr: DEFAULT_ADDR.to_string(),
             password: None,
             db: 0,
             pool_size: 10,
@@ -47,11 +50,19 @@ impl Default for ClientOptions {
 /// Redis client.
 pub struct Client {
     pool: ConnPool,
-    opts: ClientOptions,
+    opts: Arc<ClientOptions>,
 }
 
 impl Client {
     /// Create a new TCP client.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rust_redis_rs::{Client, ClientOptions};
+    ///
+    /// let client = Client::new(ClientOptions::default());
+    /// ```
     #[instrument(skip(opts))]
     pub fn new(opts: ClientOptions) -> Self {
         tracing::trace!(addr = %opts.addr, db = opts.db, pool_size = opts.pool_size, "creating client");
@@ -63,8 +74,8 @@ impl Client {
             pool_size: opts.pool_size,
             idle_timeout: opts.idle_timeout,
             dial_timeout: opts.dial_timeout,
-            read_timeout: opts.read_timeout.clone(),
-            write_timeout: opts.write_timeout.clone(),
+            read_timeout: opts.read_timeout,
+            write_timeout: opts.write_timeout,
             // Run AUTH and/or SELECT on each new connection when needed
             init_conn: if password.is_some() || db != 0 {
                 Some(Arc::new(move |mut conn: crate::connection::Connection| {
@@ -73,8 +84,9 @@ impl Client {
                     Box::pin(async move {
                         // Authenticate if password is set
                         if let Some(ref pwd) = password {
-                            let mut buf = Vec::new();
-                            parser::append_args(&mut buf, &["AUTH", pwd]);
+                            let args = ["AUTH", pwd.as_str()];
+                            let mut buf = Vec::with_capacity(parser::estimate_resp_size(&args));
+                            parser::append_args(&mut buf, &args);
                             conn.write_all(&buf).await?;
                             let v = conn.parse_reply().await?;
                             if let Value::Status(s) = v {
@@ -85,8 +97,10 @@ impl Client {
                         }
                         // Select database if not 0
                         if db > 0 {
-                            let mut buf = Vec::new();
-                            parser::append_args(&mut buf, &["SELECT", &db.to_string()]);
+                            let db_str = db.to_string();
+                            let args = ["SELECT", db_str.as_str()];
+                            let mut buf = Vec::with_capacity(parser::estimate_resp_size(&args));
+                            parser::append_args(&mut buf, &args);
                             conn.write_all(&buf).await?;
                             let v = conn.parse_reply().await?;
                             if let Value::Status(s) = v {
@@ -116,7 +130,10 @@ impl Client {
             },
             pool_opts,
         );
-        Self { pool, opts }
+        Self {
+            pool,
+            opts: Arc::new(opts),
+        }
     }
 
     /// Execute a raw command (for internal use).
@@ -126,7 +143,7 @@ impl Client {
         tracing::trace!(args_len = args.len(), "executing command");
         let mut guard = self.pool.get().await?;
         let conn = guard.conn();
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(parser::estimate_resp_size(&args));
         parser::append_args(&mut buf, &args);
         conn.write_all(&buf).await?;
         conn.parse_reply().await
@@ -137,7 +154,7 @@ impl Client {
         let v = self.process_cmd(vec!["AUTH".into(), password.into()]).await?;
         match v {
             Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected status".into())),
+            _ => Err("expected status".into()),
         }
     }
 
@@ -145,7 +162,7 @@ impl Client {
         let v = self.process_cmd(vec!["ECHO".into(), message.into()]).await?;
         match v {
             Value::BulkString(s) | Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected string".into())),
+            _ => Err("expected string".into()),
         }
     }
 
@@ -153,7 +170,7 @@ impl Client {
         let v = self.process_cmd(vec!["PING".into()]).await?;
         match v {
             Value::Status(s) | Value::BulkString(s) => Ok(s),
-            _ => Err(Error::Other("expected status".into())),
+            _ => Err("expected status".into()),
         }
     }
 
@@ -163,7 +180,7 @@ impl Client {
             .await?;
         match v {
             Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected status".into())),
+            _ => Err("expected status".into()),
         }
     }
 
@@ -176,7 +193,7 @@ impl Client {
         let v = self.process_cmd(args).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -184,7 +201,7 @@ impl Client {
         let v = self.process_cmd(vec!["EXISTS".into(), key.into()]).await?;
         match v {
             Value::Int(i) => Ok(i == 1),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -198,7 +215,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i == 1),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -209,23 +226,15 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i == 1),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
     pub async fn keys(&self, pattern: &str) -> Result<Vec<String>> {
         let v = self.process_cmd(vec!["KEYS".into(), pattern.into()]).await?;
         match v {
-            Value::Array(arr) => {
-                let mut r = Vec::new();
-                for item in arr {
-                    if let Value::BulkString(s) | Value::Status(s) = item {
-                        r.push(s);
-                    }
-                }
-                Ok(r)
-            }
-            _ => Err(Error::Other("expected array".into())),
+            Value::Array(arr) => Ok(array_to_strings(arr)),
+            _ => Err("expected array".into()),
         }
     }
 
@@ -233,7 +242,7 @@ impl Client {
         let v = self.process_cmd(vec!["PERSIST".into(), key.into()]).await?;
         match v {
             Value::Int(i) => Ok(i == 1),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -247,7 +256,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i == 1),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -258,7 +267,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i == 1),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -266,7 +275,7 @@ impl Client {
         let v = self.process_cmd(vec!["PTTL".into(), key.into()]).await?;
         match v {
             Value::Int(i) => Ok(Duration::from_millis(if i < 0 { 0 } else { i as u64 })),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -275,7 +284,7 @@ impl Client {
             Ok(Value::BulkString(s)) => Ok(Some(s)),
             Ok(Value::Status(s)) => Ok(Some(s)),
             Err(Error::Nil) => Ok(None),
-            Ok(_) => Err(Error::Other("expected string".into())),
+            Ok(_) => Err("expected string".into()),
             Err(e) => Err(e),
         }
     }
@@ -286,7 +295,7 @@ impl Client {
             .await?;
         match v {
             Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected status".into())),
+            _ => Err("expected status".into()),
         }
     }
 
@@ -296,7 +305,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i == 1),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -304,7 +313,7 @@ impl Client {
         let v = self.process_cmd(vec!["TTL".into(), key.into()]).await?;
         match v {
             Value::Int(i) => Ok(Duration::from_secs(if i < 0 { 0 } else { i as u64 })),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -312,7 +321,7 @@ impl Client {
         let v = self.process_cmd(vec!["TYPE".into(), key.into()]).await?;
         match v {
             Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected status".into())),
+            _ => Err("expected status".into()),
         }
     }
 
@@ -321,7 +330,7 @@ impl Client {
         match self.process_cmd(vec!["GET".into(), key.into()]).await {
             Ok(Value::BulkString(s)) | Ok(Value::Status(s)) => Ok(Some(s)),
             Err(Error::Nil) => Ok(None),
-            Ok(_) => Err(Error::Other("expected string".into())),
+            Ok(_) => Err("expected string".into()),
             Err(e) => Err(e),
         }
     }
@@ -332,7 +341,7 @@ impl Client {
             .await?;
         match v {
             Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected status".into())),
+            _ => Err("expected status".into()),
         }
     }
 
@@ -347,7 +356,7 @@ impl Client {
             .await?;
         match v {
             Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected status".into())),
+            _ => Err("expected status".into()),
         }
     }
 
@@ -357,7 +366,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i == 1),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -368,18 +377,8 @@ impl Client {
         }
         let v = self.process_cmd(args).await?;
         match v {
-            Value::Array(arr) => {
-                let mut r = Vec::new();
-                for item in arr {
-                    match item {
-                        Value::BulkString(s) | Value::Status(s) => r.push(Some(s)),
-                        Value::Nil => r.push(None),
-                        _ => r.push(None),
-                    }
-                }
-                Ok(r)
-            }
-            _ => Err(Error::Other("expected array".into())),
+            Value::Array(arr) => Ok(array_to_option_strings(arr)),
+            _ => Err("expected array".into()),
         }
     }
 
@@ -392,7 +391,7 @@ impl Client {
         let v = self.process_cmd(args).await?;
         match v {
             Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected status".into())),
+            _ => Err("expected status".into()),
         }
     }
 
@@ -405,7 +404,7 @@ impl Client {
         let v = self.process_cmd(args).await?;
         match v {
             Value::Int(i) => Ok(i == 1),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -413,7 +412,7 @@ impl Client {
         let v = self.process_cmd(vec!["INCR".into(), key.into()]).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -423,7 +422,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -437,9 +436,9 @@ impl Client {
             .await?;
         match v {
             Value::BulkString(s) | Value::Status(s) => {
-                s.parse().map_err(|_| Error::Other("invalid float".into()))
+                s.parse().map_err(|_| "invalid float".into())
             }
-            _ => Err(Error::Other("expected string".into())),
+            _ => Err("expected string".into()),
         }
     }
 
@@ -447,7 +446,7 @@ impl Client {
         let v = self.process_cmd(vec!["DECR".into(), key.into()]).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -457,7 +456,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -467,7 +466,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -482,7 +481,7 @@ impl Client {
             .await?;
         match v {
             Value::BulkString(s) | Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected string".into())),
+            _ => Err("expected string".into()),
         }
     }
 
@@ -493,7 +492,7 @@ impl Client {
         {
             Ok(Value::BulkString(s)) | Ok(Value::Status(s)) => Ok(Some(s)),
             Err(Error::Nil) => Ok(None),
-            Ok(_) => Err(Error::Other("expected string".into())),
+            Ok(_) => Err("expected string".into()),
             Err(e) => Err(e),
         }
     }
@@ -502,7 +501,7 @@ impl Client {
         let v = self.process_cmd(vec!["STRLEN".into(), key.into()]).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -514,7 +513,7 @@ impl Client {
         {
             Ok(Value::BulkString(s)) | Ok(Value::Status(s)) => Ok(Some(s)),
             Err(Error::Nil) => Ok(None),
-            Ok(_) => Err(Error::Other("expected string".into())),
+            Ok(_) => Err("expected string".into()),
             Err(e) => Err(e),
         }
     }
@@ -525,7 +524,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i == 1),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -549,7 +548,7 @@ impl Client {
                 }
                 Ok(m)
             }
-            _ => Err(Error::Other("expected array".into())),
+            _ => Err("expected array".into()),
         }
     }
 
@@ -561,7 +560,7 @@ impl Client {
         let v = self.process_cmd(args).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -571,7 +570,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i == 1),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -579,39 +578,23 @@ impl Client {
         let v = self.process_cmd(vec!["HLEN".into(), key.into()]).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
     pub async fn hkeys(&self, key: &str) -> Result<Vec<String>> {
         let v = self.process_cmd(vec!["HKEYS".into(), key.into()]).await?;
         match v {
-            Value::Array(arr) => {
-                let mut r = Vec::new();
-                for item in arr {
-                    if let Value::BulkString(s) | Value::Status(s) = item {
-                        r.push(s);
-                    }
-                }
-                Ok(r)
-            }
-            _ => Err(Error::Other("expected array".into())),
+            Value::Array(arr) => Ok(array_to_strings(arr)),
+            _ => Err("expected array".into()),
         }
     }
 
     pub async fn hvals(&self, key: &str) -> Result<Vec<String>> {
         let v = self.process_cmd(vec!["HVALS".into(), key.into()]).await?;
         match v {
-            Value::Array(arr) => {
-                let mut r = Vec::new();
-                for item in arr {
-                    if let Value::BulkString(s) | Value::Status(s) = item {
-                        r.push(s);
-                    }
-                }
-                Ok(r)
-            }
-            _ => Err(Error::Other("expected array".into())),
+            Value::Array(arr) => Ok(array_to_strings(arr)),
+            _ => Err("expected array".into()),
         }
     }
 
@@ -626,7 +609,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -641,9 +624,9 @@ impl Client {
             .await?;
         match v {
             Value::BulkString(s) | Value::Status(s) => {
-                s.parse().map_err(|_| Error::Other("invalid float".into()))
+                s.parse().map_err(|_| "invalid float".into())
             }
-            _ => Err(Error::Other("expected string".into())),
+            _ => Err("expected string".into()),
         }
     }
 
@@ -653,7 +636,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i == 1),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -664,18 +647,8 @@ impl Client {
         }
         let v = self.process_cmd(args).await?;
         match v {
-            Value::Array(arr) => {
-                let mut r = Vec::new();
-                for item in arr {
-                    match item {
-                        Value::BulkString(s) | Value::Status(s) => r.push(Some(s)),
-                        Value::Nil => r.push(None),
-                        _ => r.push(None),
-                    }
-                }
-                Ok(r)
-            }
-            _ => Err(Error::Other("expected array".into())),
+            Value::Array(arr) => Ok(array_to_option_strings(arr)),
+            _ => Err("expected array".into()),
         }
     }
 
@@ -692,7 +665,7 @@ impl Client {
         let v = self.process_cmd(args).await?;
         match v {
             Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected status".into())),
+            _ => Err("expected status".into()),
         }
     }
 
@@ -705,7 +678,7 @@ impl Client {
         let v = self.process_cmd(args).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -717,7 +690,7 @@ impl Client {
         let v = self.process_cmd(args).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -725,7 +698,7 @@ impl Client {
         match self.process_cmd(vec!["LPOP".into(), key.into()]).await {
             Ok(Value::BulkString(s)) | Ok(Value::Status(s)) => Ok(Some(s)),
             Err(Error::Nil) => Ok(None),
-            Ok(_) => Err(Error::Other("expected string".into())),
+            Ok(_) => Err("expected string".into()),
             Err(e) => Err(e),
         }
     }
@@ -734,7 +707,7 @@ impl Client {
         match self.process_cmd(vec!["RPOP".into(), key.into()]).await {
             Ok(Value::BulkString(s)) | Ok(Value::Status(s)) => Ok(Some(s)),
             Err(Error::Nil) => Ok(None),
-            Ok(_) => Err(Error::Other("expected string".into())),
+            Ok(_) => Err("expected string".into()),
             Err(e) => Err(e),
         }
     }
@@ -743,7 +716,7 @@ impl Client {
         let v = self.process_cmd(vec!["LLEN".into(), key.into()]).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -757,16 +730,8 @@ impl Client {
             ])
             .await?;
         match v {
-            Value::Array(arr) => {
-                let mut r = Vec::new();
-                for item in arr {
-                    if let Value::BulkString(s) | Value::Status(s) = item {
-                        r.push(s);
-                    }
-                }
-                Ok(r)
-            }
-            _ => Err(Error::Other("expected array".into())),
+            Value::Array(arr) => Ok(array_to_strings(arr)),
+            _ => Err("expected array".into()),
         }
     }
 
@@ -777,7 +742,7 @@ impl Client {
         {
             Ok(Value::BulkString(s)) | Ok(Value::Status(s)) => Ok(Some(s)),
             Err(Error::Nil) => Ok(None),
-            Ok(_) => Err(Error::Other("expected string".into())),
+            Ok(_) => Err("expected string".into()),
             Err(e) => Err(e),
         }
     }
@@ -793,7 +758,7 @@ impl Client {
             .await?;
         match v {
             Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected status".into())),
+            _ => Err("expected status".into()),
         }
     }
 
@@ -808,7 +773,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -823,7 +788,7 @@ impl Client {
             .await?;
         match v {
             Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected status".into())),
+            _ => Err("expected status".into()),
         }
     }
 
@@ -837,11 +802,11 @@ impl Client {
             Ok(Value::Array(arr)) if arr.len() >= 2 => {
                 let key = match &arr[0] {
                     Value::BulkString(s) | Value::Status(s) => s.clone(),
-                    _ => return Err(Error::Other("expected string".into())),
+                    _ => return Err("expected string".into()),
                 };
                 let val = match &arr[1] {
                     Value::BulkString(s) | Value::Status(s) => s.clone(),
-                    _ => return Err(Error::Other("expected string".into())),
+                    _ => return Err("expected string".into()),
                 };
                 Ok(Some((key, val)))
             }
@@ -861,11 +826,11 @@ impl Client {
             Ok(Value::Array(arr)) if arr.len() >= 2 => {
                 let key = match &arr[0] {
                     Value::BulkString(s) | Value::Status(s) => s.clone(),
-                    _ => return Err(Error::Other("expected string".into())),
+                    _ => return Err("expected string".into()),
                 };
                 let val = match &arr[1] {
                     Value::BulkString(s) | Value::Status(s) => s.clone(),
-                    _ => return Err(Error::Other("expected string".into())),
+                    _ => return Err("expected string".into()),
                 };
                 Ok(Some((key, val)))
             }
@@ -884,7 +849,7 @@ impl Client {
         let v = self.process_cmd(args).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -896,23 +861,15 @@ impl Client {
         let v = self.process_cmd(args).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
     pub async fn smembers(&self, key: &str) -> Result<Vec<String>> {
         let v = self.process_cmd(vec!["SMEMBERS".into(), key.into()]).await?;
         match v {
-            Value::Array(arr) => {
-                let mut r = Vec::new();
-                for item in arr {
-                    if let Value::BulkString(s) | Value::Status(s) = item {
-                        r.push(s);
-                    }
-                }
-                Ok(r)
-            }
-            _ => Err(Error::Other("expected array".into())),
+            Value::Array(arr) => Ok(array_to_strings(arr)),
+            _ => Err("expected array".into()),
         }
     }
 
@@ -922,7 +879,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i == 1),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -930,7 +887,7 @@ impl Client {
         let v = self.process_cmd(vec!["SCARD".into(), key.into()]).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -938,7 +895,7 @@ impl Client {
         match self.process_cmd(vec!["SPOP".into(), key.into()]).await {
             Ok(Value::BulkString(s)) | Ok(Value::Status(s)) => Ok(Some(s)),
             Err(Error::Nil) => Ok(None),
-            Ok(_) => Err(Error::Other("expected string".into())),
+            Ok(_) => Err("expected string".into()),
             Err(e) => Err(e),
         }
     }
@@ -947,7 +904,7 @@ impl Client {
         match self.process_cmd(vec!["SRANDMEMBER".into(), key.into()]).await {
             Ok(Value::BulkString(s)) | Ok(Value::Status(s)) => Ok(Some(s)),
             Err(Error::Nil) => Ok(None),
-            Ok(_) => Err(Error::Other("expected string".into())),
+            Ok(_) => Err("expected string".into()),
             Err(e) => Err(e),
         }
     }
@@ -959,16 +916,8 @@ impl Client {
         }
         let v = self.process_cmd(args).await?;
         match v {
-            Value::Array(arr) => {
-                let mut r = Vec::new();
-                for item in arr {
-                    if let Value::BulkString(s) | Value::Status(s) = item {
-                        r.push(s);
-                    }
-                }
-                Ok(r)
-            }
-            _ => Err(Error::Other("expected array".into())),
+            Value::Array(arr) => Ok(array_to_strings(arr)),
+            _ => Err("expected array".into()),
         }
     }
 
@@ -979,16 +928,8 @@ impl Client {
         }
         let v = self.process_cmd(args).await?;
         match v {
-            Value::Array(arr) => {
-                let mut r = Vec::new();
-                for item in arr {
-                    if let Value::BulkString(s) | Value::Status(s) = item {
-                        r.push(s);
-                    }
-                }
-                Ok(r)
-            }
-            _ => Err(Error::Other("expected array".into())),
+            Value::Array(arr) => Ok(array_to_strings(arr)),
+            _ => Err("expected array".into()),
         }
     }
 
@@ -999,16 +940,8 @@ impl Client {
         }
         let v = self.process_cmd(args).await?;
         match v {
-            Value::Array(arr) => {
-                let mut r = Vec::new();
-                for item in arr {
-                    if let Value::BulkString(s) | Value::Status(s) = item {
-                        r.push(s);
-                    }
-                }
-                Ok(r)
-            }
-            _ => Err(Error::Other("expected array".into())),
+            Value::Array(arr) => Ok(array_to_strings(arr)),
+            _ => Err("expected array".into()),
         }
     }
 
@@ -1022,7 +955,7 @@ impl Client {
         let v = self.process_cmd(args).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -1034,7 +967,7 @@ impl Client {
         let v = self.process_cmd(args).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -1048,16 +981,8 @@ impl Client {
             ])
             .await?;
         match v {
-            Value::Array(arr) => {
-                let mut r = Vec::new();
-                for item in arr {
-                    if let Value::BulkString(s) | Value::Status(s) = item {
-                        r.push(s);
-                    }
-                }
-                Ok(r)
-            }
-            _ => Err(Error::Other("expected array".into())),
+            Value::Array(arr) => Ok(array_to_strings(arr)),
+            _ => Err("expected array".into()),
         }
     }
 
@@ -1072,31 +997,8 @@ impl Client {
             ])
             .await?;
         match v {
-            Value::Array(arr) => {
-                let mut zz = Vec::new();
-                let mut i = 0;
-                while i + 1 < arr.len() {
-                    let member = match &arr[i] {
-                        Value::BulkString(s) | Value::Status(s) => s.clone(),
-                        _ => {
-                            i += 1;
-                            continue;
-                        }
-                    };
-                    let score_str = match &arr[i + 1] {
-                        Value::BulkString(s) | Value::Status(s) => s.clone(),
-                        _ => {
-                            i += 1;
-                            continue;
-                        }
-                    };
-                    let score: f64 = score_str.parse().unwrap_or(0.0);
-                    zz.push(Z { score, member });
-                    i += 2;
-                }
-                Ok(zz)
-            }
-            _ => Err(Error::Other("expected array".into())),
+            Value::Array(arr) => array_to_z_vec(arr),
+            _ => Err("expected array".into()),
         }
     }
 
@@ -1104,7 +1006,7 @@ impl Client {
         let v = self.process_cmd(vec!["ZCARD".into(), key.into()]).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -1114,10 +1016,10 @@ impl Client {
             .await
         {
             Ok(Value::BulkString(s)) | Ok(Value::Status(s)) => {
-                s.parse().map(Some).map_err(|_| Error::Other("invalid float".into()))
+                s.parse().map(Some).map_err(|_| "invalid float".into())
             }
             Err(Error::Nil) => Ok(None),
-            Ok(_) => Err(Error::Other("expected string".into())),
+            Ok(_) => Err("expected string".into()),
             Err(e) => Err(e),
         }
     }
@@ -1129,7 +1031,7 @@ impl Client {
         {
             Ok(Value::Int(i)) => Ok(Some(i)),
             Err(Error::Nil) => Ok(None),
-            Ok(_) => Err(Error::Other("expected int".into())),
+            Ok(_) => Err("expected int".into()),
             Err(e) => Err(e),
         }
     }
@@ -1141,7 +1043,7 @@ impl Client {
         {
             Ok(Value::Int(i)) => Ok(Some(i)),
             Err(Error::Nil) => Ok(None),
-            Ok(_) => Err(Error::Other("expected int".into())),
+            Ok(_) => Err("expected int".into()),
             Err(e) => Err(e),
         }
     }
@@ -1156,16 +1058,8 @@ impl Client {
             ])
             .await?;
         match v {
-            Value::Array(arr) => {
-                let mut r = Vec::new();
-                for item in arr {
-                    if let Value::BulkString(s) | Value::Status(s) = item {
-                        r.push(s);
-                    }
-                }
-                Ok(r)
-            }
-            _ => Err(Error::Other("expected array".into())),
+            Value::Array(arr) => Ok(array_to_strings(arr)),
+            _ => Err("expected array".into()),
         }
     }
 
@@ -1180,31 +1074,8 @@ impl Client {
             ])
             .await?;
         match v {
-            Value::Array(arr) => {
-                let mut zz = Vec::new();
-                let mut i = 0;
-                while i + 1 < arr.len() {
-                    let member = match &arr[i] {
-                        Value::BulkString(s) | Value::Status(s) => s.clone(),
-                        _ => {
-                            i += 1;
-                            continue;
-                        }
-                    };
-                    let score_str = match &arr[i + 1] {
-                        Value::BulkString(s) | Value::Status(s) => s.clone(),
-                        _ => {
-                            i += 1;
-                            continue;
-                        }
-                    };
-                    let score: f64 = score_str.parse().unwrap_or(0.0);
-                    zz.push(Z { score, member });
-                    i += 2;
-                }
-                Ok(zz)
-            }
-            _ => Err(Error::Other("expected array".into())),
+            Value::Array(arr) => array_to_z_vec(arr),
+            _ => Err("expected array".into()),
         }
     }
 
@@ -1214,7 +1085,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -1229,9 +1100,9 @@ impl Client {
             .await?;
         match v {
             Value::BulkString(s) | Value::Status(s) => {
-                s.parse().map_err(|_| Error::Other("invalid float".into()))
+                s.parse().map_err(|_| "invalid float".into())
             }
-            _ => Err(Error::Other("expected string".into())),
+            _ => Err("expected string".into()),
         }
     }
 
@@ -1240,7 +1111,7 @@ impl Client {
         let v = self.process_cmd(vec!["FLUSHDB".into()]).await?;
         match v {
             Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected status".into())),
+            _ => Err("expected status".into()),
         }
     }
 
@@ -1248,7 +1119,7 @@ impl Client {
         let v = self.process_cmd(vec!["FLUSHALL".into()]).await?;
         match v {
             Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected status".into())),
+            _ => Err("expected status".into()),
         }
     }
 
@@ -1256,7 +1127,7 @@ impl Client {
         let v = self.process_cmd(vec!["INFO".into()]).await?;
         match v {
             Value::BulkString(s) | Value::Status(s) => Ok(s),
-            _ => Err(Error::Other("expected string".into())),
+            _ => Err("expected string".into()),
         }
     }
 
@@ -1264,7 +1135,7 @@ impl Client {
         let v = self.process_cmd(vec!["DBSIZE".into()]).await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 
@@ -1279,6 +1150,21 @@ impl Client {
     }
 
     /// Get a pipeline for batch operations.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use rust_redis_rs::{Client, ClientOptions};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = Client::new(ClientOptions::default());
+    /// let pipeline = client.pipeline();
+    /// pipeline.set("key1", "value1").await;
+    /// pipeline.set("key2", "value2").await;
+    /// let results = pipeline.execute().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn pipeline(&self) -> crate::pipeline::Pipeline {
         crate::pipeline::Pipeline::new(self.clone())
     }
@@ -1300,7 +1186,7 @@ impl Client {
             .await?;
         match v {
             Value::Int(i) => Ok(i),
-            _ => Err(Error::Other("expected int".into())),
+            _ => Err("expected int".into()),
         }
     }
 }
@@ -1309,13 +1195,69 @@ impl Clone for Client {
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
-            opts: self.opts.clone(),
+            opts: Arc::clone(&self.opts),
         }
     }
 }
 
+/// Extract string elements from a Redis array (BulkString or Status).
+fn array_to_strings(arr: Vec<Value>) -> Vec<String> {
+    arr.into_iter()
+        .filter_map(|item| match item {
+            Value::BulkString(s) | Value::Status(s) => Some(s),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Extract Vec<Z> from a Redis array of [member, score, ...] pairs.
+fn array_to_z_vec(arr: Vec<Value>) -> Result<Vec<Z>> {
+    let mut zz = Vec::with_capacity(arr.len() / 2);
+    let mut i = 0;
+    while i + 1 < arr.len() {
+        let member = match &arr[i] {
+            Value::BulkString(s) | Value::Status(s) => s.clone(),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let score_str = match &arr[i + 1] {
+            Value::BulkString(s) | Value::Status(s) => s.clone(),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let score: f64 = score_str
+            .parse()
+            .map_err(|_| Error::from("invalid float in zrange"))?;
+        zz.push(Z { score, member });
+        i += 2;
+    }
+    Ok(zz)
+}
+
+/// Extract Option<String> from a Redis array (BulkString/Status -> Some, Nil -> None).
+fn array_to_option_strings(arr: Vec<Value>) -> Vec<Option<String>> {
+    arr.into_iter()
+        .map(|item| match item {
+            Value::BulkString(s) | Value::Status(s) => Some(s),
+            Value::Nil => None,
+            _ => None,
+        })
+        .collect()
+}
+
 /// Format float for Redis: strip trailing zeros (e.g. 1.0 -> "1").
+/// Returns "nan" or "inf"/"-inf" for special values (Redis accepts these).
 fn format_float(f: f64) -> String {
+    if f.is_nan() {
+        return "nan".to_string();
+    }
+    if f.is_infinite() {
+        return if f.is_sign_positive() { "inf" } else { "-inf" }.to_string();
+    }
     let s = format!("{f}");
     if s.contains('.') {
         s.trim_end_matches('0').trim_end_matches('.').to_string()
@@ -1329,9 +1271,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_format_float() {
+        assert_eq!(format_float(1.0), "1");
+        assert_eq!(format_float(1.5), "1.5");
+        assert_eq!(format_float(0.0), "0");
+        assert_eq!(format_float(f64::NAN), "nan");
+        assert_eq!(format_float(f64::INFINITY), "inf");
+        assert_eq!(format_float(f64::NEG_INFINITY), "-inf");
+    }
+
+    #[test]
     fn test_client_options_default() {
         let opts = ClientOptions::default();
-        assert_eq!(opts.addr, "127.0.0.1:6379");
+        assert_eq!(opts.addr, DEFAULT_ADDR);
         assert_eq!(opts.db, 0);
         assert_eq!(opts.pool_size, 10);
         assert!(opts.password.is_none());

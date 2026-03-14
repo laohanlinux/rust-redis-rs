@@ -4,8 +4,10 @@
 //! Uses a dedicated connection (not returned to pool while subscribed).
 
 use crate::client::Client;
-use crate::error::Result;
+use crate::connection::Connection;
+use crate::error::{Error, Result};
 use crate::parser::{self, Value};
+use tokio::sync::Mutex;
 use tracing::instrument;
 
 /// Pub/Sub message.
@@ -28,86 +30,83 @@ pub enum PubSubMessage {
 }
 
 /// Pub/Sub subscriber.
+/// Holds a dedicated connection for the subscription session.
 pub struct PubSub {
     client: Client,
+    conn: Mutex<Option<Connection>>,
 }
 
 impl PubSub {
     /// Create a new Pub/Sub subscriber.
     pub fn new(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            conn: Mutex::new(None),
+        }
+    }
+
+    /// Ensure we have a dedicated connection; acquire from pool if needed.
+    async fn ensure_conn(&self) -> Result<()> {
+        let mut guard = self.conn.lock().await;
+        if guard.is_none() {
+            let pool_guard = self.client.pool().get().await?;
+            let conn = pool_guard.remove();
+            *guard = Some(conn);
+        }
+        Ok(())
+    }
+
+    /// Send a subscribe/unsubscribe command.
+    async fn send_sub_cmd(&self, cmd: &str, items: &[impl AsRef<str>]) -> Result<()> {
+        self.ensure_conn().await?;
+        let mut args = vec![cmd.to_string()];
+        for item in items {
+            args.push(item.as_ref().to_string());
+        }
+        let mut guard = self.conn.lock().await;
+        let conn = guard.as_mut().expect("connection established by ensure_conn");
+        let mut buf = Vec::with_capacity(parser::estimate_resp_size(&args));
+        parser::append_args(&mut buf, &args);
+        conn.write_all(&buf).await?;
+        Ok(())
     }
 
     /// Subscribe to channels.
     #[instrument(skip(self, channels))]
     pub async fn subscribe(&self, channels: &[impl AsRef<str>]) -> Result<()> {
         tracing::trace!(channel_count = channels.len(), "subscribing");
-        let mut args = vec!["SUBSCRIBE".to_string()];
-        for c in channels {
-            args.push(c.as_ref().to_string());
-        }
-        let mut guard = self.client.pool().get().await?;
-        let conn = guard.conn();
-        let mut buf = Vec::new();
-        parser::append_args(&mut buf, &args);
-        conn.write_all(&buf).await?;
-        Ok(())
+        self.send_sub_cmd("SUBSCRIBE", channels).await
     }
 
     /// Subscribe to patterns.
     pub async fn psubscribe(&self, patterns: &[impl AsRef<str>]) -> Result<()> {
-        let mut args = vec!["PSUBSCRIBE".to_string()];
-        for p in patterns {
-            args.push(p.as_ref().to_string());
-        }
-        let mut guard = self.client.pool().get().await?;
-        let conn = guard.conn();
-        let mut buf = Vec::new();
-        parser::append_args(&mut buf, &args);
-        conn.write_all(&buf).await?;
-        Ok(())
+        self.send_sub_cmd("PSUBSCRIBE", patterns).await
     }
 
     /// Unsubscribe from channels.
     pub async fn unsubscribe(&self, channels: &[impl AsRef<str>]) -> Result<()> {
-        let mut args = vec!["UNSUBSCRIBE".to_string()];
-        for c in channels {
-            args.push(c.as_ref().to_string());
-        }
-        let mut guard = self.client.pool().get().await?;
-        let conn = guard.conn();
-        let mut buf = Vec::new();
-        parser::append_args(&mut buf, &args);
-        conn.write_all(&buf).await?;
-        Ok(())
+        self.send_sub_cmd("UNSUBSCRIBE", channels).await
     }
 
     /// Unsubscribe from patterns.
     pub async fn punsubscribe(&self, patterns: &[impl AsRef<str>]) -> Result<()> {
-        let mut args = vec!["PUNSUBSCRIBE".to_string()];
-        for p in patterns {
-            args.push(p.as_ref().to_string());
-        }
-        let mut guard = self.client.pool().get().await?;
-        let conn = guard.conn();
-        let mut buf = Vec::new();
-        parser::append_args(&mut buf, &args);
-        conn.write_all(&buf).await?;
-        Ok(())
+        self.send_sub_cmd("PUNSUBSCRIBE", patterns).await
     }
 
     /// Receive the next message.
     #[instrument(skip(self))]
     pub async fn receive(&self) -> Result<PubSubMessage> {
-        let mut guard = self.client.pool().get().await?;
-        let conn = guard.conn();
+        let mut guard = self.conn.lock().await;
+        let conn = guard
+            .as_mut()
+            .ok_or_else(|| Error::from("not subscribed; call subscribe or psubscribe first"))?;
         let v = conn.parse_reply().await?;
         // Pub/Sub messages are arrays: [kind, channel/pattern, payload/count]
         match v {
             Value::Array(arr) if arr.len() >= 3 => {
                 let kind = match &arr[0] {
                     Value::BulkString(s) | Value::Status(s) => s.clone(),
-                    _ => return Err(crate::error::Error::Other("expected string".into())),
+                    _ => return Err("expected string".into()),
                 };
                 match kind.as_str() {
                     // Subscription confirmation: [kind, channel, count]
@@ -158,12 +157,12 @@ impl PubSub {
                             payload,
                         })
                     }
-                    _ => Err(crate::error::Error::Other(format!(
+                    _ => Err(Error::Other(format!(
                         "unsupported message: {kind}"
                     ))),
                 }
             }
-            _ => Err(crate::error::Error::Other("expected array".into())),
+            _ => Err("expected array".into()),
         }
     }
 }

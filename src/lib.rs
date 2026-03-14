@@ -42,11 +42,11 @@ pub mod pubsub;
 pub mod script;
 pub mod sentinel;
 
-pub use client::{Client, ClientOptions};
+pub use client::{Client, ClientOptions, DEFAULT_ADDR};
 pub use error::{Error, Result};
 pub use multi::Multi;
 pub use parser::Z;
 pub use pipeline::Pipeline;
 pub use pubsub::{PubSub, PubSubMessage};
 pub use script::Script;
-pub use sentinel::{FailoverClient, FailoverOptions};
+pub use sentinel::{FailoverClient, FailoverOptions, DEFAULT_SENTINEL_ADDR};

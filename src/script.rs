@@ -4,7 +4,7 @@
 //! run() tries EVALSHA first and falls back to EVAL on NOSCRIPT.
 
 use crate::client::Client;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::parser::Value;
 use sha1::{Digest, Sha1};
 use tracing::instrument;
@@ -35,7 +35,7 @@ impl Script {
             .await?;
         match v {
             Value::BulkString(s) | Value::Status(s) => Ok(s),
-            _ => Err(crate::error::Error::Other("expected string".into())),
+            _ => Err("expected string".into()),
         }
     }
 
@@ -54,8 +54,30 @@ impl Script {
                 }
                 Ok(r)
             }
-            _ => Err(crate::error::Error::Other("expected array".into())),
+            _ => Err("expected array".into()),
         }
+    }
+
+    /// Build EVAL/EVALSHA command args.
+    fn build_args(
+        &self,
+        cmd: &str,
+        script_or_hash: &str,
+        keys: &[impl AsRef<str>],
+        args: &[impl AsRef<str>],
+    ) -> Vec<String> {
+        let mut cmd_args = vec![
+            cmd.to_string(),
+            script_or_hash.to_string(),
+            keys.len().to_string(),
+        ];
+        for k in keys {
+            cmd_args.push(k.as_ref().to_string());
+        }
+        for a in args {
+            cmd_args.push(a.as_ref().to_string());
+        }
+        cmd_args
     }
 
     /// Run the script (tries EVALSHA first, falls back to EVAL).
@@ -66,33 +88,13 @@ impl Script {
         keys: &[impl AsRef<str>],
         args: &[impl AsRef<str>],
     ) -> Result<Value> {
-        let mut cmd_args = vec![
-            "EVALSHA".to_string(),
-            self.hash.clone(),
-            keys.len().to_string(),
-        ];
-        for k in keys {
-            cmd_args.push(k.as_ref().to_string());
-        }
-        for a in args {
-            cmd_args.push(a.as_ref().to_string());
-        }
+        let cmd_args = self.build_args("EVALSHA", &self.hash, keys, args);
 
         match client.process_cmd(cmd_args).await {
             Ok(v) => Ok(v),
             // Script not loaded; fall back to EVAL with full source
-            Err(e) if e.to_string().contains("NOSCRIPT") => {
-                let mut cmd_args = vec![
-                    "EVAL".to_string(),
-                    self.src.clone(),
-                    keys.len().to_string(),
-                ];
-                for k in keys {
-                    cmd_args.push(k.as_ref().to_string());
-                }
-                for a in args {
-                    cmd_args.push(a.as_ref().to_string());
-                }
+            Err(e) if matches!(&e, Error::Redis(re) if re.0.contains("NOSCRIPT")) => {
+                let cmd_args = self.build_args("EVAL", &self.src, keys, args);
                 client.process_cmd(cmd_args).await
             }
             Err(e) => Err(e),
@@ -106,17 +108,7 @@ impl Script {
         keys: &[impl AsRef<str>],
         args: &[impl AsRef<str>],
     ) -> Result<Value> {
-        let mut cmd_args = vec![
-            "EVAL".to_string(),
-            self.src.clone(),
-            keys.len().to_string(),
-        ];
-        for k in keys {
-            cmd_args.push(k.as_ref().to_string());
-        }
-        for a in args {
-            cmd_args.push(a.as_ref().to_string());
-        }
+        let cmd_args = self.build_args("EVAL", &self.src, keys, args);
         client.process_cmd(cmd_args).await
     }
 
@@ -127,17 +119,7 @@ impl Script {
         keys: &[impl AsRef<str>],
         args: &[impl AsRef<str>],
     ) -> Result<Value> {
-        let mut cmd_args = vec![
-            "EVALSHA".to_string(),
-            self.hash.clone(),
-            keys.len().to_string(),
-        ];
-        for k in keys {
-            cmd_args.push(k.as_ref().to_string());
-        }
-        for a in args {
-            cmd_args.push(a.as_ref().to_string());
-        }
+        let cmd_args = self.build_args("EVALSHA", &self.hash, keys, args);
         client.process_cmd(cmd_args).await
     }
 }

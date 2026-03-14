@@ -4,42 +4,97 @@
 //! - Simple strings (`+`), Errors (`-`), Integers (`:`)
 //! - Bulk strings (`$`), Arrays (`*`)
 
-use crate::error::{redis_error, RedisError, Result};
+use crate::error::{redis_error, Error, RedisError, Result};
 use async_recursion::async_recursion;
 use bytes::BufMut;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+/// Number of decimal digits in n (1 for 0). Zero allocation.
+#[inline]
+fn decimal_len(n: usize) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut n = n;
+    let mut len = 0;
+    while n > 0 {
+        len += 1;
+        n /= 10;
+    }
+    len
+}
+
+/// Estimate buffer size needed for RESP format of args.
+pub fn estimate_resp_size(args: &[impl AsRef<str>]) -> usize {
+    let mut n = 4 + decimal_len(args.len()); // *<n>\r\n
+    for arg in args {
+        let s = arg.as_ref();
+        n += 1 + decimal_len(s.len()) + 2 + s.len() + 2; // $<len>\r\n<data>\r\n
+    }
+    n
+}
 
 /// Serialize command arguments to RESP format and append to buffer.
 ///
 /// Format: `*<n>\r\n` followed by n `$<len>\r\n<data>\r\n` segments.
 pub fn append_args(buf: &mut Vec<u8>, args: &[impl AsRef<str>]) {
+    let mut itoa_buf = itoa::Buffer::new();
     // Write array header: *<count>\r\n
     buf.put_u8(b'*');
-    buf.extend_from_slice(args.len().to_string().as_bytes());
+    buf.extend_from_slice(itoa_buf.format(args.len()).as_bytes());
     buf.extend_from_slice(b"\r\n");
     // Write each argument as bulk string: $<len>\r\n<data>\r\n
     for arg in args {
         let s = arg.as_ref();
         buf.put_u8(b'$');
-        buf.extend_from_slice(s.len().to_string().as_bytes());
+        buf.extend_from_slice(itoa_buf.format(s.len()).as_bytes());
         buf.extend_from_slice(b"\r\n");
         buf.extend_from_slice(s.as_bytes());
         buf.extend_from_slice(b"\r\n")
     }
 }
 
+/// Maximum line length for RESP (prevents unbounded allocation from malformed input).
+const MAX_LINE_LEN: usize = 64 * 1024;
+
 /// Read a line from the reader (until `\r\n` or `\n`).
+/// Returns error if line exceeds 64KB.
 pub async fn read_line<R: AsyncBufReadExt + Unpin>(rd: &mut R) -> Result<Vec<u8>> {
-    let mut line = Vec::new();
-    let n = rd.read_until(b'\n', &mut line).await?;
-    if n == 0 {
-        return Err(RedisError("unexpected EOF".into()).into());
-    }
-    // Strip trailing \r\n or \n (Redis uses \r\n, but be tolerant)
-    if line.ends_with(b"\r\n") {
-        line.truncate(line.len() - 2);
-    } else if line.ends_with(&[b'\n']) {
-        line.truncate(line.len() - 1);
+    let mut line = Vec::with_capacity(256);
+    loop {
+        let (consume_len, found_newline) = {
+            let buf = rd.fill_buf().await?;
+            if buf.is_empty() {
+                if line.is_empty() {
+                    return Err(RedisError("unexpected EOF".into()).into());
+                }
+                break;
+            }
+            let mut consume_len = buf.len();
+            let mut found_newline = false;
+            for (i, &b) in buf.iter().enumerate() {
+                if line.len() >= MAX_LINE_LEN {
+                    return Err(RedisError("line too long".into()).into());
+                }
+                line.push(b);
+                if b == b'\n' {
+                    consume_len = i + 1;
+                    found_newline = true;
+                    break;
+                }
+            }
+            (consume_len, found_newline)
+        };
+        rd.consume(consume_len);
+        if found_newline {
+            // Strip trailing \r\n or \n (Redis uses \r\n, but be tolerant)
+            if line.ends_with(b"\r\n") {
+                line.truncate(line.len() - 2);
+            } else if line.ends_with(b"\n") {
+                line.truncate(line.len() - 1);
+            }
+            return Ok(line);
+        }
     }
     Ok(line)
 }
@@ -76,7 +131,10 @@ pub enum Value {
 
 /// Parse a Redis reply, dispatching by first byte to the appropriate parser.
 #[async_recursion]
-pub async fn parse_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin + Send>(rd: &mut R) -> Result<Value> {
+pub async fn parse_reply<R>(rd: &mut R) -> Result<Value>
+where
+    R: AsyncBufReadExt + AsyncReadExt + Unpin + Send,
+{
     let line = read_line(rd).await?;
     if line.is_empty() {
         return Err(redis_error("empty reply").into());
@@ -128,16 +186,19 @@ pub async fn parse_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin + Send>(rd: &
 }
 
 #[async_recursion]
-async fn parse_slice_inner<R: AsyncBufReadExt + AsyncReadExt + Unpin + Send>(
+async fn parse_slice_inner<R>(
     rd: &mut R,
     n: i64,
-) -> Result<Value> {
+) -> Result<Value>
+where
+    R: AsyncBufReadExt + AsyncReadExt + Unpin + Send,
+{
     let mut vals = Vec::with_capacity(n as usize);
     for _ in 0..n {
         // Treat nil errors as Nil values within arrays (e.g. SORT with GET)
         match parse_reply(rd).await {
             Ok(v) => vals.push(v),
-            Err(e) if e.to_string().contains("nil") => vals.push(Value::Nil),
+            Err(Error::Nil) => vals.push(Value::Nil),
             Err(e) => return Err(e),
         }
     }
@@ -369,5 +430,14 @@ mod tests {
         let mut rd = make_reader(b"*0\r\n");
         let v = parse_reply(&mut rd).await.unwrap();
         assert!(matches!(v, Value::Array(arr) if arr.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn test_read_line_too_long() {
+        // 65537 bytes without newline exceeds MAX_LINE_LEN (64KB)
+        let data: Vec<u8> = vec![b'+'; 65537];
+        let mut rd = make_reader(&data);
+        let err = read_line(&mut rd).await.unwrap_err();
+        assert!(err.to_string().contains("line too long"));
     }
 }

@@ -2,7 +2,6 @@
 //!
 //! Run with: cargo test --test integration_test -- --ignored
 
-use std::fs::OpenOptions;
 use rust_redis_rs::{Client, ClientOptions, Script, Z};
 use std::time::Duration;
 
@@ -196,7 +195,6 @@ async fn test_lua_script() {
 #[tokio::test]
 #[ignore]
 async fn test_client_close() {
-    let mut option = OpenOptions::new();
     let client = client();
     client.ping().await.unwrap();
     client.close().await.unwrap();

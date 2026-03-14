@@ -1,6 +1,15 @@
 //! Redis command types and result handlers.
 //!
 //! Typed command wrappers that parse Redis replies into Rust types.
+//! This module provides an alternative, builder-style API for constructing
+//! and parsing Redis commands. It is reserved for future extensibility
+//! when a more composable command API is needed.
+//!
+//! The main [`Client`](crate::client::Client) uses a simpler method-per-command
+//! API. Use this module if you need typed command construction with
+//! custom parsing logic.
+
+#![allow(dead_code)]
 
 use crate::error::Result;
 use crate::parser::{Value, Z};
@@ -47,7 +56,7 @@ impl GenericCmd {
 
     pub fn result(&self) -> Result<Option<Value>> {
         if let Some(ref e) = self.base.err {
-            return Err(e.clone().into());
+            return Err(e.clone());
         }
         Ok(self.val.clone())
     }
@@ -83,7 +92,7 @@ impl StatusCmd {
 
     pub fn result(&self) -> Result<String> {
         if let Some(ref e) = self.base.err {
-            return Err(e.clone().into());
+            return Err(e.clone());
         }
         self.val
             .clone()
@@ -121,7 +130,7 @@ impl IntCmd {
 
     pub fn result(&self) -> Result<i64> {
         if let Some(ref e) = self.base.err {
-            return Err(e.clone().into());
+            return Err(e.clone());
         }
         self.val
             .ok_or_else(|| crate::error::Error::Other("no value".into()))
@@ -154,7 +163,7 @@ impl BoolCmd {
 
     pub fn result(&self) -> Result<bool> {
         if let Some(ref e) = self.base.err {
-            return Err(e.clone().into());
+            return Err(e.clone());
         }
         self.val
             .ok_or_else(|| crate::error::Error::Other("no value".into()))
@@ -188,7 +197,7 @@ impl StringCmd {
 
     pub fn result(&self) -> Result<Option<String>> {
         if let Some(ref e) = self.base.err {
-            return Err(e.clone().into());
+            return Err(e.clone());
         }
         Ok(self.val.clone())
     }
@@ -220,7 +229,7 @@ impl FloatCmd {
 
     pub fn result(&self) -> Result<f64> {
         if let Some(ref e) = self.base.err {
-            return Err(e.clone().into());
+            return Err(e.clone());
         }
         self.val
             .ok_or_else(|| crate::error::Error::Other("no value".into()))
@@ -261,7 +270,7 @@ impl DurationCmd {
 
     pub fn result(&self) -> Result<Duration> {
         if let Some(ref e) = self.base.err {
-            return Err(e.clone().into());
+            return Err(e.clone());
         }
         self.val
             .ok_or_else(|| crate::error::Error::Other("no value".into()))
@@ -302,7 +311,7 @@ impl StringSliceCmd {
 
     pub fn result(&self) -> Result<Vec<String>> {
         if let Some(ref e) = self.base.err {
-            return Err(e.clone().into());
+            return Err(e.clone());
         }
         Ok(self.val.clone().unwrap_or_default())
     }
@@ -334,7 +343,7 @@ impl SliceCmd {
 
     pub fn result(&self) -> Result<Vec<Value>> {
         if let Some(ref e) = self.base.err {
-            return Err(e.clone().into());
+            return Err(e.clone());
         }
         Ok(self.val.clone().unwrap_or_default())
     }
@@ -374,7 +383,7 @@ impl BoolSliceCmd {
 
     pub fn result(&self) -> Result<Vec<bool>> {
         if let Some(ref e) = self.base.err {
-            return Err(e.clone().into());
+            return Err(e.clone());
         }
         Ok(self.val.clone().unwrap_or_default())
     }
@@ -420,7 +429,7 @@ impl StringMapCmd {
 
     pub fn result(&self) -> Result<HashMap<String, String>> {
         if let Some(ref e) = self.base.err {
-            return Err(e.clone().into());
+            return Err(e.clone());
         }
         Ok(self.val.clone().unwrap_or_default())
     }
@@ -467,7 +476,7 @@ impl ZSliceCmd {
 
     pub fn result(&self) -> Result<Vec<Z>> {
         if let Some(ref e) = self.base.err {
-            return Err(e.clone().into());
+            return Err(e.clone());
         }
         Ok(self.val.clone().unwrap_or_default())
     }
@@ -520,7 +529,7 @@ impl ScanCmd {
 
     pub fn result(&self) -> Result<(i64, Vec<String>)> {
         if let Some(ref e) = self.base.err {
-            return Err(e.clone().into());
+            return Err(e.clone());
         }
         Ok((
             self.cursor.unwrap_or(0),

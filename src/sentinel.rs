@@ -8,6 +8,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::instrument;
 
+/// Default Sentinel address.
+pub const DEFAULT_SENTINEL_ADDR: &str = "127.0.0.1:26379";
+
 /// Failover options for Sentinel.
 #[derive(Clone)]
 pub struct FailoverOptions {
@@ -26,7 +29,7 @@ impl Default for FailoverOptions {
     fn default() -> Self {
         Self {
             master_name: "mymaster".to_string(),
-            sentinel_addrs: vec!["127.0.0.1:26379".to_string()],
+            sentinel_addrs: vec![DEFAULT_SENTINEL_ADDR.to_string()],
             password: None,
             db: 0,
             pool_size: 10,
@@ -65,18 +68,19 @@ impl FailoverClient {
                 db: 0,
                 pool_size: 1,
                 dial_timeout: self.opts.dial_timeout,
-                read_timeout: self.opts.read_timeout.clone(),
-                write_timeout: self.opts.write_timeout.clone(),
+                read_timeout: self.opts.read_timeout,
+                write_timeout: self.opts.write_timeout,
                 idle_timeout: None,
             });
-            match client
+            let result = client
                 .process_cmd(vec![
                     "SENTINEL".into(),
                     "get-master-addr-by-name".into(),
                     self.opts.master_name.clone(),
                 ])
-                .await
-            {
+                .await;
+            let _ = client.close().await;
+            match result {
                 // SENTINEL get-master-addr-by-name returns [host, port]
                 Ok(crate::parser::Value::Array(arr)) if arr.len() >= 2 => {
                     let host = match &arr[0] {
@@ -108,9 +112,9 @@ impl FailoverClient {
             db: self.opts.db,
             pool_size: self.opts.pool_size,
             dial_timeout: self.opts.dial_timeout,
-            read_timeout: self.opts.read_timeout.clone(),
-            write_timeout: self.opts.write_timeout.clone(),
-            idle_timeout: self.opts.idle_timeout.clone(),
+            read_timeout: self.opts.read_timeout,
+            write_timeout: self.opts.write_timeout,
+            idle_timeout: self.opts.idle_timeout,
         }))
     }
 }

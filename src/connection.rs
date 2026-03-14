@@ -25,7 +25,7 @@ impl Connection {
         let addr = stream.peer_addr().ok();
         trace!(?addr, "new connection");
         Self {
-            stream: BufReader::new(stream),
+            stream: BufReader::with_capacity(16 * 1024, stream),
             read_timeout: None,
             write_timeout: None,
         }
